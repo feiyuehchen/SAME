@@ -1,0 +1,8 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+pytorch-lightning>=2.0.0
+nemo_toolkit[asr]>=1.19.0
+numpy>=1.21.0
+scikit-learn>=1.0.0
+tensorboard>=2.10.0
+

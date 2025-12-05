@@ -1,0 +1,303 @@
+"""
+ASVspoof 2019 LA Dataset
+Loads audio files and returns raw waveforms for TitaNet encoder
+"""
+import os
+import torch
+import torchaudio
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
+from typing import Tuple, Optional
+import numpy as np
+
+# Import RawBoost augmentation
+try:
+    from RawBoost import ISD_additive_noise, LnL_convolutive_noise, SSI_additive_noise, normWav
+except ImportError:
+    print("Warning: RawBoost not found. Data augmentation will be disabled.")
+
+
+class ASVspoofDataset(Dataset):
+    """ASVspoof 2019 Dataset that returns raw audio waveforms"""
+    
+    def __init__(
+        self,
+        protocol_path: str,
+        audio_dir: str,
+        max_length: int = 64000,
+        sample_rate: int = 16000,
+        return_utt_id: bool = False,
+        use_augmentation: bool = False,
+        augmentation_algo: list = [1, 2, 3]
+    ):
+        """
+        Args:
+            protocol_path: Path to protocol file (e.g., ASVspoof2019.LA.cm.train.trn.txt)
+            audio_dir: Path to directory containing audio files
+            max_length: Maximum audio length in samples (will pad/truncate)
+            sample_rate: Target sample rate
+            return_utt_id: If True, also return utterance ID for evaluation
+            use_augmentation: If True, apply RawBoost augmentation on-the-fly
+            augmentation_algo: List of RawBoost algorithms to use [1,2,3]
+        """
+        self.audio_dir = audio_dir
+        self.max_length = max_length
+        self.sample_rate = sample_rate
+        self.return_utt_id = return_utt_id
+        self.use_augmentation = use_augmentation
+        self.augmentation_algo = augmentation_algo
+        
+        # Parse protocol file
+        self.data = self._parse_protocol(protocol_path)
+        
+    def _parse_protocol(self, protocol_path: str):
+        """Parse ASVspoof protocol file"""
+        data = []
+        with open(protocol_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    speaker_id = parts[0]
+                    utt_id = parts[1]
+                    label = parts[4]  # 'bonafide' or 'spoof'
+                    
+                    # Convert label to binary: 0 = bonafide, 1 = spoof
+                    label_int = 0 if label == 'bonafide' else 1
+                    
+                    data.append({
+                        'speaker_id': speaker_id,
+                        'utt_id': utt_id,
+                        'label': label_int,
+                        'label_str': label
+                    })
+        return data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def _load_audio(self, utt_id: str) -> torch.Tensor:
+        """Load audio file and preprocess"""
+        # Audio files are in .flac format
+        audio_path = os.path.join(self.audio_dir, f"{utt_id}.flac")
+        
+        # Load audio
+        waveform, sr = torchaudio.load(audio_path)
+        
+        # Resample if necessary
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+            waveform = resampler(waveform)
+        
+        # Convert to mono if stereo
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+        # Pad or truncate to max_length
+        if waveform.shape[1] < self.max_length:
+            # Pad with zeros
+            padding = self.max_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, padding))
+        elif waveform.shape[1] > self.max_length:
+            # Random crop during training, center crop during eval
+            # For now, center crop
+            start = (waveform.shape[1] - self.max_length) // 2
+            waveform = waveform[:, start:start + self.max_length]
+        
+        return waveform.squeeze(0)  # Return shape (T,)
+    
+    def _apply_rawboost(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RawBoost augmentation on-the-fly
+        Default parameters from: https://github.com/TakHemlata/RawBoost-antispoofing
+        """
+        # Convert to numpy for RawBoost
+        audio_np = waveform.numpy()
+        
+        # Randomly select one augmentation algorithm from the list
+        algo_id = np.random.choice(self.augmentation_algo)
+        
+        # RawBoost default parameters (optimized for LA)
+        # Linear & Non-linear Convolutive Noise (LnL)
+        N_f = 5  # Order of non-linearity
+        nBands = 5  # Number of notch filters
+        minF, maxF = 20, 8000  # Frequency range [Hz]
+        minBW, maxBW = 100, 1000  # Bandwidth range [Hz]
+        minCoeff, maxCoeff = 10, 100  # Filter coefficients
+        minG, maxG = 0, 0  # Gain factor
+        minBiasLinNonLin, maxBiasLinNonLin = 5, 20  # Linear/non-linear bias
+        
+        # Impulsive Signal-Dependent (ISD) Noise
+        P = 10  # Max uniformly distributed samples [%]
+        g_sd = 2  # Gain parameter
+        
+        # Stationary Signal-Independent (SSI) Noise
+        SNRmin, SNRmax = 10, 40  # SNR range [dB]
+        
+        # Apply selected augmentation
+        if algo_id == 1:
+            # Algorithm 1: Linear and non-linear convolutive noise
+            audio_np = LnL_convolutive_noise(
+                audio_np, N_f, nBands, minF, maxF, minBW, maxBW,
+                minCoeff, maxCoeff, minG, maxG, minBiasLinNonLin,
+                maxBiasLinNonLin, self.sample_rate
+            )
+        elif algo_id == 2:
+            # Algorithm 2: Impulsive signal-dependent additive noise
+            audio_np = ISD_additive_noise(audio_np, P, g_sd)
+        elif algo_id == 3:
+            # Algorithm 3: Stationary signal-independent additive noise
+            audio_np = SSI_additive_noise(
+                audio_np, SNRmin, SNRmax, nBands, minF, maxF, minBW,
+                maxBW, minCoeff, maxCoeff, minG, maxG, self.sample_rate
+            )
+        
+        # Normalize
+        audio_np = normWav(audio_np, 0)
+        
+        # Convert back to tensor
+        return torch.from_numpy(audio_np).float()
+    
+    def __getitem__(self, idx: int) -> Tuple:
+        """Get a single sample"""
+        item = self.data[idx]
+        
+        # Load audio
+        waveform = self._load_audio(item['utt_id'])
+        
+        # Apply data augmentation if enabled (training only)
+        if self.use_augmentation:
+            try:
+                waveform = self._apply_rawboost(waveform)
+            except Exception as e:
+                # If augmentation fails, use original waveform
+                print(f"Warning: RawBoost augmentation failed for {item['utt_id']}: {e}")
+                pass
+        
+        label = item['label']
+        
+        if self.return_utt_id:
+            return waveform, label, item['utt_id']
+        else:
+            return waveform, label
+
+
+class ASVspoofDataModule(pl.LightningDataModule):
+    """PyTorch Lightning DataModule for ASVspoof 2019"""
+    
+    def __init__(
+        self,
+        train_protocol: str,
+        dev_protocol: str,
+        train_audio_dir: str,
+        dev_audio_dir: str,
+        batch_size: int = 64,
+        num_workers: int = 4,
+        max_length: int = 64000,
+        sample_rate: int = 16000,
+        use_augmentation: bool = False,
+        augmentation_algo: list = [1, 2, 3]
+    ):
+        super().__init__()
+        self.train_protocol = train_protocol
+        self.dev_protocol = dev_protocol
+        self.train_audio_dir = train_audio_dir
+        self.dev_audio_dir = dev_audio_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.max_length = max_length
+        self.sample_rate = sample_rate
+        self.use_augmentation = use_augmentation
+        self.augmentation_algo = augmentation_algo
+        
+    def setup(self, stage: Optional[str] = None):
+        """Setup train and validation datasets"""
+        if stage == "fit" or stage is None:
+            # Training set (with augmentation if enabled)
+            self.train_dataset = ASVspoofDataset(
+                protocol_path=self.train_protocol,
+                audio_dir=self.train_audio_dir,
+                max_length=self.max_length,
+                sample_rate=self.sample_rate,
+                return_utt_id=False,
+                use_augmentation=self.use_augmentation,
+                augmentation_algo=self.augmentation_algo
+            )
+            
+            # Development set for validation (official split, NO augmentation)
+            # This is the correct usage - Dev set is designed for model selection
+            # Final results should be reported on Eval set
+            self.val_dataset = ASVspoofDataset(
+                protocol_path=self.dev_protocol,
+                audio_dir=self.dev_audio_dir,
+                max_length=self.max_length,
+                sample_rate=self.sample_rate,
+                return_utt_id=True,  # Return utt_id for EER calculation
+                use_augmentation=False  # Never augment validation data
+            )
+            
+            print(f"Using official ASVspoof 2019 LA splits:")
+            print(f"  Train: {len(self.train_dataset)} samples" + 
+                  (f" (with RawBoost augmentation: {self.augmentation_algo})" if self.use_augmentation else ""))
+            print(f"  Dev (validation): {len(self.val_dataset)} samples (no augmentation)")
+            print(f"  → Final evaluation should be done on Eval set")
+    
+    def train_dataloader(self):
+        """Return training dataloader"""
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+    
+    def val_dataloader(self):
+        """Return validation dataloader"""
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+
+
+def test_dataset():
+    """Test dataset loading"""
+    from config import Config
+    
+    print("Testing ASVspoofDataset...")
+    
+    # Test training dataset
+    train_dataset = ASVspoofDataset(
+        protocol_path=Config.get_train_protocol_path(),
+        audio_dir=Config.get_train_audio_path(),
+        max_length=Config.max_length,
+        sample_rate=Config.sample_rate
+    )
+    
+    print(f"Training dataset size: {len(train_dataset)}")
+    
+    # Load a sample
+    waveform, label = train_dataset[0]
+    print(f"Waveform shape: {waveform.shape}")
+    print(f"Label: {label} ({'bonafide' if label == 0 else 'spoof'})")
+    
+    # Test dataloader
+    dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    batch_waveform, batch_labels = next(iter(dataloader))
+    print(f"Batch waveform shape: {batch_waveform.shape}")
+    print(f"Batch labels: {batch_labels}")
+    
+    print("Dataset test passed!")
+
+
+if __name__ == "__main__":
+    test_dataset()
+
