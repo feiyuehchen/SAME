@@ -9,12 +9,81 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from typing import Tuple, Optional
 import numpy as np
+import io
 
 # Import RawBoost augmentation
 try:
     from RawBoost import ISD_additive_noise, LnL_convolutive_noise, SSI_additive_noise, normWav
 except ImportError:
     print("Warning: RawBoost not found. Data augmentation will be disabled.")
+
+
+class CodecAugment:
+    """
+    Apply Codec Augmentation (MP3, AAC, etc.)
+    Simulates audio compression artifacts
+    """
+    def __init__(self, sample_rate=16000, formats=['mp3', 'aac']):
+        self.sample_rate = sample_rate
+        self.formats = formats
+        
+    def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        Apply random codec compression
+        Args:
+            waveform: Audio waveform, shape (T,)
+        Returns:
+            Augmented waveform
+        """
+        # Select random format
+        fmt = np.random.choice(self.formats)
+        
+        # Prepare for saving (ensure 2D: C x T)
+        if waveform.dim() == 1:
+            waveform_save = waveform.unsqueeze(0)
+        else:
+            waveform_save = waveform
+            
+        # Buffer for in-memory file
+        out_file = io.BytesIO()
+        
+        try:
+            # Map simple format names to torchaudio parameters if needed
+            # For AAC, we often use MP4 container
+            save_fmt = fmt
+            if fmt == 'aac':
+                save_fmt = 'mp4'
+            
+            # Save to buffer
+            # Note: This requires ffmpeg to be available for mp3/mp4
+            torchaudio.save(out_file, waveform_save, self.sample_rate, format=save_fmt)
+            
+            # Read back
+            out_file.seek(0)
+            aug_waveform, sr = torchaudio.load(out_file, format=save_fmt)
+            
+            # Resample back if sample rate changed
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                aug_waveform = resampler(aug_waveform)
+                
+            # Ensure length matches original (padding or cropping)
+            orig_len = waveform.shape[0]
+            aug_len = aug_waveform.shape[1]
+            
+            if aug_len < orig_len:
+                padding = orig_len - aug_len
+                aug_waveform = torch.nn.functional.pad(aug_waveform, (0, padding))
+            elif aug_len > orig_len:
+                aug_waveform = aug_waveform[:, :orig_len]
+                
+            return aug_waveform.squeeze(0)
+            
+        except Exception as e:
+            # If augmentation fails (e.g. missing ffmpeg), return original
+            # Don't spam logs, but maybe print once?
+            # print(f"Codec augmentation ({fmt}) failed: {e}")
+            return waveform
 
 
 class ASVspoofDataset(Dataset):
@@ -28,7 +97,9 @@ class ASVspoofDataset(Dataset):
         sample_rate: int = 16000,
         return_utt_id: bool = False,
         use_augmentation: bool = False,
-        augmentation_algo: list = [1, 2, 3]
+        augmentation_algo: list = [1, 2, 3],
+        use_codec_aug: bool = False,
+        codec_aug_formats: list = ['mp3', 'aac']
     ):
         """
         Args:
@@ -39,6 +110,8 @@ class ASVspoofDataset(Dataset):
             return_utt_id: If True, also return utterance ID for evaluation
             use_augmentation: If True, apply RawBoost augmentation on-the-fly
             augmentation_algo: List of RawBoost algorithms to use [1,2,3]
+            use_codec_aug: If True, apply Codec augmentation
+            codec_aug_formats: List of formats for Codec augmentation
         """
         self.audio_dir = audio_dir
         self.max_length = max_length
@@ -46,6 +119,13 @@ class ASVspoofDataset(Dataset):
         self.return_utt_id = return_utt_id
         self.use_augmentation = use_augmentation
         self.augmentation_algo = augmentation_algo
+        self.use_codec_aug = use_codec_aug
+        
+        # Initialize Codec Augmentation
+        if use_codec_aug:
+            self.codec_augment = CodecAugment(sample_rate, codec_aug_formats)
+        else:
+            self.codec_augment = None
         
         # Parse protocol file
         self.data = self._parse_protocol(protocol_path)
@@ -59,17 +139,24 @@ class ASVspoofDataset(Dataset):
                 if len(parts) >= 5:
                     speaker_id = parts[0]
                     utt_id = parts[1]
-                    label = parts[4]  # 'bonafide' or 'spoof'
                     
-                    # Convert label to binary: 0 = bonafide, 1 = spoof
-                    label_int = 0 if label == 'bonafide' else 1
+                    # Auto-detect label column (compatible with 2019 and 2021)
+                    label = None
+                    if parts[4] in ['bonafide', 'spoof']:
+                        label = parts[4]
+                    elif len(parts) > 5 and parts[5] in ['bonafide', 'spoof']:
+                        label = parts[5]
                     
-                    data.append({
-                        'speaker_id': speaker_id,
-                        'utt_id': utt_id,
-                        'label': label_int,
-                        'label_str': label
-                    })
+                    if label is not None:
+                        # Convert label to binary: 0 = bonafide, 1 = spoof
+                        label_int = 0 if label == 'bonafide' else 1
+                        
+                        data.append({
+                            'speaker_id': speaker_id,
+                            'utt_id': utt_id,
+                            'label': label_int,
+                            'label_str': label
+                        })
         return data
     
     def __len__(self):
@@ -173,6 +260,17 @@ class ASVspoofDataset(Dataset):
                 print(f"Warning: RawBoost augmentation failed for {item['utt_id']}: {e}")
                 pass
         
+        # Apply Codec augmentation if enabled (training only)
+        if self.use_codec_aug and self.codec_augment is not None:
+            # Apply with 50% probability if not combined with RawBoost, 
+            # or sequentially. Let's apply it sequentially but randomly.
+            # Here we apply it always if enabled, or maybe random choice?
+            # Usually augmentation is applied with some probability.
+            # Let's assume if enabled, we apply it. 
+            # But we might want to mix original, rawboost, and codec.
+            # For now, apply on top of potentially RawBoosted audio.
+            waveform = self.codec_augment(waveform)
+        
         label = item['label']
         
         if self.return_utt_id:
@@ -195,7 +293,9 @@ class ASVspoofDataModule(pl.LightningDataModule):
         max_length: int = 64000,
         sample_rate: int = 16000,
         use_augmentation: bool = False,
-        augmentation_algo: list = [1, 2, 3]
+        augmentation_algo: list = [1, 2, 3],
+        use_codec_aug: bool = False,
+        codec_aug_formats: list = ['mp3', 'aac']
     ):
         super().__init__()
         self.train_protocol = train_protocol
@@ -208,6 +308,8 @@ class ASVspoofDataModule(pl.LightningDataModule):
         self.sample_rate = sample_rate
         self.use_augmentation = use_augmentation
         self.augmentation_algo = augmentation_algo
+        self.use_codec_aug = use_codec_aug
+        self.codec_aug_formats = codec_aug_formats
         
     def setup(self, stage: Optional[str] = None):
         """Setup train and validation datasets"""
@@ -220,7 +322,9 @@ class ASVspoofDataModule(pl.LightningDataModule):
                 sample_rate=self.sample_rate,
                 return_utt_id=False,
                 use_augmentation=self.use_augmentation,
-                augmentation_algo=self.augmentation_algo
+                augmentation_algo=self.augmentation_algo,
+                use_codec_aug=self.use_codec_aug,
+                codec_aug_formats=self.codec_aug_formats
             )
             
             # Development set for validation (official split, NO augmentation)
@@ -232,12 +336,14 @@ class ASVspoofDataModule(pl.LightningDataModule):
                 max_length=self.max_length,
                 sample_rate=self.sample_rate,
                 return_utt_id=True,  # Return utt_id for EER calculation
-                use_augmentation=False  # Never augment validation data
+                use_augmentation=False,  # Never augment validation data
+                use_codec_aug=False
             )
             
             print(f"Using official ASVspoof 2019 LA splits:")
             print(f"  Train: {len(self.train_dataset)} samples" + 
-                  (f" (with RawBoost augmentation: {self.augmentation_algo})" if self.use_augmentation else ""))
+                  (f" (with RawBoost augmentation: {self.augmentation_algo})" if self.use_augmentation else "") +
+                  (f" (with Codec augmentation: {self.codec_aug_formats})" if self.use_codec_aug else ""))
             print(f"  Dev (validation): {len(self.val_dataset)} samples (no augmentation)")
             print(f"  → Final evaluation should be done on Eval set")
     

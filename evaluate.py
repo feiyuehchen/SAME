@@ -88,9 +88,11 @@ def evaluate_model(model, dataset, device='cuda', desc='Evaluating', target_only
             # Forward pass
             outputs = model.forward(audio, compute_ot=False)
             
-            # Score = -reconstruction_error (higher = more bonafide)
-            # Use negative error directly as score for better separation
-            scores = -outputs['recon_error']
+            # Score calculation for Dual Bank
+            # Higher score = more bonafide
+            # Bonafide: Low Real Error, High Spoof Error -> High Score
+            # Spoof: High Real Error, Low Spoof Error -> Low Score
+            scores = outputs['error_spoof'] - outputs['error_real']
             
             all_scores.append(scores.cpu().numpy())
             all_labels.append(labels.numpy())
@@ -311,7 +313,7 @@ def main(args):
     # Evaluate on evaluation set (if available)
     if args.eval_eval:
         print("-"*80)
-        print("Evaluating on Evaluation Set")
+        print("Evaluating on ASVspoof 2019 LA Evaluation Set")
         print("(FINAL TEST - Report this result in papers)")
         print("-"*80)
         
@@ -351,17 +353,17 @@ def main(args):
             # Complete evaluation (all samples)
             if not args.target_only or args.compare_both:
                 print("\n" + "="*60)
-                print("COMPLETE EVALUATION (All samples)")
+                print("COMPLETE EVALUATION 2019 (All samples)")
                 print("="*60)
                 
                 eval_scores, eval_labels, eval_utt_ids = evaluate_model(
-                    model, eval_dataset, device, desc='Eval set (complete)'
+                    model, eval_dataset, device, desc='Eval set 2019 (complete)'
                 )
                 
                 # Compute metrics
                 eval_metrics = compute_metrics(eval_scores, eval_labels)
                 
-                print(f"\nEvaluation Set Results (Complete):")
+                print(f"\nEvaluation Set 2019 Results (Complete):")
                 print(f"  EER: {eval_metrics['eer']*100:.4f}%")
                 print(f"  EER Threshold: {eval_metrics['eer_threshold']:.6f}")
                 print(f"  # Bonafide: {eval_metrics['num_bonafide']}")
@@ -381,7 +383,7 @@ def main(args):
                 
                 # Save complete scores
                 if args.save_scores:
-                    score_file = os.path.join(args.output_dir, 'eval_scores_complete.txt')
+                    score_file = os.path.join(args.output_dir, 'eval_scores_2019_complete.txt')
                     save_scores(eval_scores, eval_labels, eval_utt_ids, score_file)
                     print(f"  ✓ Scores saved to: {score_file}")
             
@@ -389,18 +391,18 @@ def main(args):
             if args.target_only or args.compare_both:
                 if eval_target_ids:
                     print("\n" + "="*60)
-                    print("TARGET-ONLY EVALUATION (For SAMO comparison)")
+                    print("TARGET-ONLY EVALUATION 2019 (For SAMO comparison)")
                     print("="*60)
                     
                     eval_scores_target, eval_labels_target, eval_utt_ids_target = evaluate_model(
-                        model, eval_dataset, device, desc='Eval set (target-only)', 
+                        model, eval_dataset, device, desc='Eval set 2019 (target-only)', 
                         target_only_ids=eval_target_ids
                     )
                     
                     # Compute metrics
                     eval_metrics_target = compute_metrics(eval_scores_target, eval_labels_target)
                     
-                    print(f"\nEvaluation Set Results (Target-only):")
+                    print(f"\nEvaluation Set 2019 Results (Target-only):")
                     print(f"  EER: {eval_metrics_target['eer']*100:.4f}%")
                     print(f"  EER Threshold: {eval_metrics_target['eer_threshold']:.6f}")
                     print(f"  # Bonafide: {eval_metrics_target['num_bonafide']}")
@@ -420,12 +422,61 @@ def main(args):
                     
                     # Save target-only scores
                     if args.save_scores:
-                        score_file = os.path.join(args.output_dir, 'eval_scores_target_only.txt')
+                        score_file = os.path.join(args.output_dir, 'eval_scores_2019_target_only.txt')
                         save_scores(eval_scores_target, eval_labels_target, eval_utt_ids_target, score_file)
                         print(f"  ✓ Scores saved to: {score_file}")
         
         print()
     
+    # Evaluate on ASVspoof 2021 LA (if requested)
+    if args.eval_2021:
+        print("-"*80)
+        print("Evaluating on ASVspoof 2021 LA Evaluation Set")
+        print("(Additional robustness test)")
+        print("-"*80)
+        
+        eval_protocol_2021 = Config.get_eval_protocol_2021_path()
+        eval_audio_dir_2021 = Config.get_eval_audio_2021_path()
+        
+        if not os.path.exists(eval_protocol_2021):
+            print(f"✗ 2021 Evaluation protocol not found: {eval_protocol_2021}")
+            print("  Skipping 2021 evaluation set")
+        else:
+            eval_dataset_2021 = ASVspoofDataset(
+                protocol_path=eval_protocol_2021,
+                audio_dir=eval_audio_dir_2021,
+                max_length=Config.max_length,
+                sample_rate=Config.sample_rate,
+                return_utt_id=True
+            )
+            
+            print("\n" + "="*60)
+            print("COMPLETE EVALUATION 2021 (All samples)")
+            print("="*60)
+            
+            eval_scores_2021, eval_labels_2021, eval_utt_ids_2021 = evaluate_model(
+                model, eval_dataset_2021, device, desc='Eval set 2021'
+            )
+            
+            # Compute metrics
+            eval_metrics_2021 = compute_metrics(eval_scores_2021, eval_labels_2021)
+            
+            print(f"\nEvaluation Set 2021 Results (Complete):")
+            print(f"  EER: {eval_metrics_2021['eer']*100:.4f}%")
+            print(f"  EER Threshold: {eval_metrics_2021['eer_threshold']:.6f}")
+            print(f"  # Bonafide: {eval_metrics_2021['num_bonafide']}")
+            print(f"  # Spoof: {eval_metrics_2021['num_spoof']}")
+            print(f"  Bonafide score: {eval_metrics_2021['bonafide_score_mean']:.6f} ± {eval_metrics_2021['bonafide_score_std']:.6f}")
+            print(f"  Spoof score: {eval_metrics_2021['spoof_score_mean']:.6f} ± {eval_metrics_2021['spoof_score_std']:.6f}")
+            
+            # Save scores
+            if args.save_scores:
+                score_file = os.path.join(args.output_dir, 'eval_scores_2021.txt')
+                save_scores(eval_scores_2021, eval_labels_2021, eval_utt_ids_2021, score_file)
+                print(f"  ✓ Scores saved to: {score_file}")
+        
+        print()
+
     print("="*80)
     print("Evaluation Complete")
     print("="*80)
@@ -490,6 +541,13 @@ if __name__ == "__main__":
         action='store_true',
         default=True,
         help='Evaluate on evaluation set (if available)'
+    )
+    
+    parser.add_argument(
+        '--eval-2021',
+        action='store_true',
+        default=True,
+        help='Evaluate on ASVspoof 2021 LA evaluation set'
     )
     
     parser.add_argument(

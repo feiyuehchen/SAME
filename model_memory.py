@@ -40,6 +40,9 @@ class OTMemoryTitaNet(pl.LightningModule):
         weight_decay: float = 1e-4,
         lambda_recon: float = 1.0,
         lambda_ot: float = 0.1,
+        lambda_oc: float = 0.5,
+        lambda_div: float = 0.1,
+        top_k: int = 10,
         margin: float = 1.0,
         sinkhorn_iterations: int = 3,
         sinkhorn_epsilon: float = 0.05,
@@ -50,11 +53,14 @@ class OTMemoryTitaNet(pl.LightningModule):
         Args:
             titanet_model: Name of TitaNet model
             embed_dim: Embedding dimension
-            memory_slots: Number of memory prototypes
+            memory_slots: Number of memory prototypes per bank
             freeze_encoder: Whether to freeze TitaNet encoder
             lr: Learning rate
             lambda_recon: Weight for reconstruction loss
             lambda_ot: Weight for OT loss
+            lambda_oc: Weight for OC-Softmax loss
+            lambda_div: Weight for Diversity loss
+            top_k: Top-K slots for sparse attention
             margin: Hinge loss margin
             sinkhorn_iterations: Number of Sinkhorn iterations
             sinkhorn_epsilon: Entropy regularization parameter
@@ -68,6 +74,7 @@ class OTMemoryTitaNet(pl.LightningModule):
         
         self.embed_dim = embed_dim
         self.memory_slots = memory_slots
+        self.top_k = top_k
         self.lr = lr
         self.sinkhorn_iterations = sinkhorn_iterations
         self.sinkhorn_epsilon = sinkhorn_epsilon
@@ -80,24 +87,26 @@ class OTMemoryTitaNet(pl.LightningModule):
             embed_dim=embed_dim
         )
         
-        # Memory bank: learnable prototypes
-        self.memory_bank = nn.Parameter(
-            torch.randn(memory_slots, embed_dim)
-        )
+        # Dual Memory Banks: Real and Spoof
+        self.memory_bonafide = nn.Parameter(torch.randn(memory_slots, embed_dim))
+        self.memory_spoof = nn.Parameter(torch.randn(memory_slots, embed_dim))
+        
         # Initialize with normalized vectors
         with torch.no_grad():
-            self.memory_bank.data = F.normalize(self.memory_bank.data, p=2, dim=1)
+            self.memory_bonafide.data = F.normalize(self.memory_bonafide.data, p=2, dim=1)
+            self.memory_spoof.data = F.normalize(self.memory_spoof.data, p=2, dim=1)
         
         # Learnable temperature scaling for logits (used in OT assignment)
-        # This allows the model to control the sharpness of the distribution
-        # Keep initial value low (e.g., 1.0) to prevent numerical instability (exp overflow in Sinkhorn)
         self.logit_scale = nn.Parameter(torch.ones(1) * logit_scale_init)
         
         # Loss function
         self.loss_fn = OTMemoryLoss(
             lambda_recon=lambda_recon,
             lambda_ot=lambda_ot,
-            margin=margin
+            lambda_oc=lambda_oc,
+            lambda_div=lambda_div,
+            margin=margin,
+            feat_dim=embed_dim
         )
         
         # For validation: collect predictions
@@ -141,6 +150,46 @@ class OTMemoryTitaNet(pl.LightningModule):
         
         return Q
     
+    def _process_memory_bank(self, z, memory_bank):
+        """Helper to process one memory bank with sparse attention"""
+        # Normalize memory bank
+        memory_normalized = F.normalize(memory_bank, p=2, dim=1)
+        
+        # Compute similarity: z @ memory.T
+        similarity = torch.matmul(z, memory_normalized.t())  # (B, memory_slots)
+        
+        # Sparse Attention (Top-K)
+        topk_values, topk_indices = torch.topk(similarity, k=self.top_k, dim=1)
+        topk_softmax = F.softmax(topk_values, dim=1) # (B, K)
+        
+        # Construct full attention weights (for diversity loss)
+        B, K = similarity.shape
+        attn_weights = torch.zeros_like(similarity)
+        attn_weights.scatter_(1, topk_indices, topk_softmax)
+        
+        # Reconstruct
+        # Retrieve top-k memory vectors
+        # topk_indices shape: (B, top_k)
+        # memory_normalized shape: (slots, dim)
+        # We want (B, top_k, dim)
+        
+        # Expand memory for gathering
+        # Or simply use embedding lookup if we view memory as embedding layer
+        # memory_normalized[indices] works if indices is (B, top_k)
+        # but we need to flatten or use advanced indexing
+        
+        # Using F.embedding is cleaner
+        selected_memory = F.embedding(topk_indices, memory_normalized) # (B, top_k, dim)
+        
+        # Weighted sum
+        # topk_softmax: (B, top_k) -> (B, top_k, 1)
+        z_recon = torch.sum(selected_memory * topk_softmax.unsqueeze(2), dim=1) # (B, dim)
+        
+        # Compute reconstruction error
+        recon_error = torch.sum((z - z_recon) ** 2, dim=1) # (B,)
+        
+        return z_recon, recon_error, similarity, attn_weights
+
     def forward(
         self,
         audio: torch.Tensor,
@@ -148,54 +197,41 @@ class OTMemoryTitaNet(pl.LightningModule):
         compute_ot: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass
-        
-        Args:
-            audio: Raw audio waveform, shape (B, T)
-            audio_lengths: Audio lengths, shape (B,)
-            compute_ot: Whether to compute OT (only during training)
-        
-        Returns:
-            Dictionary containing:
-                - z: Normalized embeddings from encoder, shape (B, embed_dim)
-                - recon_error: Reconstruction error per sample, shape (B,)
-                - logits: OT logits (if compute_ot), shape (B, memory_slots)
-                - Q: Sinkhorn assignment (if compute_ot), shape (B, memory_slots)
+        Forward pass with Dual Memory Banks
         """
         # Extract embeddings from TitaNet
         z = self.encoder(audio, audio_lengths)  # (B, embed_dim)
         
-        # Normalize memory bank
-        memory_normalized = F.normalize(self.memory_bank, p=2, dim=1)
-        
-        # Compute similarity between embeddings and memory bank
-        # Cosine similarity: z @ memory.T
-        similarity = torch.matmul(z, memory_normalized.t())  # (B, memory_slots)
-        
-        # Compute attention weights (softmax over memory slots)
-        attn_weights = F.softmax(similarity, dim=1)  # (B, memory_slots)
-        
-        # Reconstruct embeddings using weighted sum of memory
-        z_recon = torch.matmul(attn_weights, memory_normalized)  # (B, embed_dim)
-        
-        # Compute reconstruction error (L2 distance)
-        recon_error = torch.sum((z - z_recon) ** 2, dim=1)  # (B,)
-        
+        # Process Bonafide Bank
+        z_recon_real, error_real, sim_real, attn_real = \
+            self._process_memory_bank(z, self.memory_bonafide)
+            
+        # Process Spoof Bank
+        z_recon_spoof, error_spoof, sim_spoof, attn_spoof = \
+            self._process_memory_bank(z, self.memory_spoof)
+            
         output = {
             'z': z,
-            'recon_error': recon_error,
-            'attn_weights': attn_weights
+            'error_real': error_real,
+            'error_spoof': error_spoof,
+            'attn_weights_real': attn_real,
+            'attn_weights_spoof': attn_spoof
         }
         
         # Compute OT assignment if requested (training only)
         if compute_ot:
-            # Use scaled similarity as logits for OT assignment
-            # This ensures OT loss directly affects memory_bank distribution
-            logits = self.logit_scale * similarity  # (B, memory_slots)
-            Q = self.sinkhorn(logits)  # (B, memory_slots)
+            # Real logits
+            logits_real = self.logit_scale * sim_real
+            Q_real = self.sinkhorn(logits_real)
             
-            output['logits'] = logits
-            output['Q'] = Q
+            # Spoof logits
+            logits_spoof = self.logit_scale * sim_spoof
+            Q_spoof = self.sinkhorn(logits_spoof)
+            
+            output['logits_real'] = logits_real
+            output['Q_real'] = Q_real
+            output['logits_spoof'] = logits_spoof
+            output['Q_spoof'] = Q_spoof
         
         return output
     
@@ -206,62 +242,62 @@ class OTMemoryTitaNet(pl.LightningModule):
         # Forward pass
         outputs = self.forward(audio, compute_ot=True)
         
-        # Separate bonafide and spoof for OT loss
+        # Prepare OT inputs (only for samples matching the bank)
         is_bonafide = (labels == 0)
+        is_spoof = (labels == 1)
+        
+        logits_list = [None, None]
+        Q_list = [None, None]
         
         if is_bonafide.sum() > 0:
-            logits_bonafide = outputs['logits'][is_bonafide]
-            Q_bonafide = outputs['Q'][is_bonafide]
-        else:
-            logits_bonafide = None
-            Q_bonafide = None
+            logits_list[0] = outputs['logits_real'][is_bonafide]
+            Q_list[0] = outputs['Q_real'][is_bonafide]
+            
+        if is_spoof.sum() > 0:
+            logits_list[1] = outputs['logits_spoof'][is_spoof]
+            Q_list[1] = outputs['Q_spoof'][is_spoof]
         
         # Compute loss
         loss_dict = self.loss_fn(
-            recon_error=outputs['recon_error'],
-            logits=logits_bonafide,
-            Q=Q_bonafide,
+            error_real=outputs['error_real'],
+            error_spoof=outputs['error_spoof'],
+            logits=logits_list,
+            Q=Q_list,
             labels=labels,
+            embeddings=outputs['z'],
+            attn_weights=[outputs['attn_weights_real'], outputs['attn_weights_spoof']],
             use_ot=True
         )
         
-        # Log metrics (step-based)
-        self.log('train/loss', loss_dict['loss'], on_step=True, on_epoch=False, 
-                 prog_bar=True, sync_dist=True)
-        self.log('train/recon_loss', loss_dict['recon_loss'], on_step=True, on_epoch=False,
-                 sync_dist=True)
-        self.log('train/recon_loss_bonafide', loss_dict['recon_loss_bonafide'], 
-                 on_step=True, on_epoch=False, sync_dist=True)
-        self.log('train/recon_loss_spoof', loss_dict['recon_loss_spoof'], 
-                 on_step=True, on_epoch=False, sync_dist=True)
-        self.log('train/ot_loss', loss_dict['ot_loss'], on_step=True, on_epoch=False,
-                 sync_dist=True)
+        # Log metrics
+        self.log('train/loss', loss_dict['loss'], on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        self.log('train/recon_loss', loss_dict['recon_loss'], on_step=True, on_epoch=False, sync_dist=True)
+        self.log('train/ot_loss', loss_dict['ot_loss'], on_step=True, on_epoch=False, sync_dist=True)
+        self.log('train/oc_loss', loss_dict['oc_loss'], on_step=True, on_epoch=False, sync_dist=True)
+        self.log('train/div_loss', loss_dict['div_loss'], on_step=True, on_epoch=False, sync_dist=True)
         
         return loss_dict['loss']
     
     def validation_step(self, batch: Tuple, batch_idx: int):
-        """Validation step - collect predictions for EER calculation"""
-        # Handle both cases: with or without utt_ids
+        """Validation step"""
         if len(batch) == 3:
             audio, labels, utt_ids = batch
         else:
             audio, labels = batch
             utt_ids = None
         
-        # Forward pass (no OT during validation)
         outputs = self.forward(audio, compute_ot=False)
         
-        # Store predictions
-        # Score: -recon_error (higher score = more bonafide)
-        # Use negative error directly for better score separation
-        scores = -outputs['recon_error']
+        # Score: Error(Spoof) - Error(Real)
+        # Bonafide: Low Real Error, High Spoof Error -> High Score
+        # Spoof: High Real Error, Low Spoof Error -> Low Score
+        scores = outputs['error_spoof'] - outputs['error_real']
         
-        # Collect for epoch-end evaluation
         self.validation_step_outputs.append({
             'scores': scores.detach().cpu(),
             'labels': labels.detach().cpu(),
             'utt_ids': utt_ids if utt_ids is not None else [],
-            'recon_errors': outputs['recon_error'].detach().cpu()
+            'recon_errors': outputs['error_real'].detach().cpu() # Log real error
         })
     
     def on_validation_epoch_end(self):
@@ -370,12 +406,13 @@ def test_model():
         
         print(f"\nForward pass outputs:")
         print(f"  z shape: {outputs['z'].shape}")
-        print(f"  recon_error shape: {outputs['recon_error'].shape}")
-        print(f"  logits shape: {outputs['logits'].shape}")
-        print(f"  Q shape: {outputs['Q'].shape}")
+        print(f"  error_real shape: {outputs['error_real'].shape}")
+        print(f"  error_spoof shape: {outputs['error_spoof'].shape}")
+        print(f"  logits_real shape: {outputs['logits_real'].shape}")
+        print(f"  Q_real shape: {outputs['Q_real'].shape}")
         
         # Check Sinkhorn properties
-        Q = outputs['Q']
+        Q = outputs['Q_real']
         print(f"\nSinkhorn Q properties:")
         print(f"  Row sums (should be ~1): {Q.sum(dim=1)}")
         print(f"  Column sums (should be ~{batch_size/64:.4f}): {Q.sum(dim=0)[:5]}...")

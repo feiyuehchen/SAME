@@ -32,7 +32,9 @@ def main(args):
         max_length=Config.max_length,
         sample_rate=Config.sample_rate,
         use_augmentation=Config.use_data_augmentation,
-        augmentation_algo=Config.rawboost_algo
+        augmentation_algo=Config.rawboost_algo,
+        use_codec_aug=Config.use_codec_aug,
+        codec_aug_formats=Config.codec_aug_formats
     )
     
     # Create model
@@ -46,6 +48,9 @@ def main(args):
         weight_decay=Config.weight_decay,
         lambda_recon=Config.lambda_recon,
         lambda_ot=Config.lambda_ot,
+        lambda_oc=Config.lambda_oc,
+        lambda_div=Config.lambda_diversity,
+        top_k=Config.top_k,
         margin=Config.margin,
         sinkhorn_iterations=Config.sinkhorn_iterations,
         sinkhorn_epsilon=Config.sinkhorn_epsilon,
@@ -114,8 +119,16 @@ def main(args):
         algo_names = {1: 'LnL_convolutive', 2: 'ISD_additive', 3: 'SSI_additive'}
         algo_str = ', '.join([algo_names.get(a, f'Unknown({a})') for a in Config.rawboost_algo])
         print(f"  RawBoost Algorithms: {algo_str}")
+    
+    print(f"Codec Augmentation: {'Enabled' if Config.use_codec_aug else 'Disabled'}")
+    if Config.use_codec_aug:
+        print(f"  Formats: {Config.codec_aug_formats}")
+        
     print(f"Lambda Recon: {Config.lambda_recon}")
     print(f"Lambda OT: {Config.lambda_ot}")
+    print(f"Lambda OC: {Config.lambda_oc}")
+    print(f"Lambda Diversity: {Config.lambda_diversity}")
+    print(f"Top-K: {Config.top_k}")
     print(f"Margin: {Config.margin}")
     print(f"Devices: {Config.devices}")
     print(f"Strategy: {Config.strategy}")

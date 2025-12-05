@@ -23,6 +23,7 @@ class Config:
     embed_dim = 192
     memory_slots = 64
     freeze_encoder = False  # Set to True to freeze TitaNet encoder (RECOMMENDED to prevent overfitting)
+    top_k = 10 # Sparse attention Top-K
     
     # Training hyperparameters
     batch_size = 128  
@@ -40,9 +41,15 @@ class Config:
     # Algorithms: 1=LnL_convolutive_noise, 2=ISD_additive_noise, 3=SSI_additive_noise
     rawboost_algo = [1, 2, 3]  # List of augmentation algorithms (paper uses combination for LA)
     
+    # Codec Augmentation
+    use_codec_aug = False
+    codec_aug_formats = ['mp3', 'aac']
+
     # Loss hyperparameters
     lambda_recon = 1.0
     lambda_ot = 0.3  # Increased from 0.1 for stronger regularization
+    lambda_oc = 0.5 # Weight for OC-Softmax
+    lambda_diversity = 0.1 # Weight for Diversity Loss
     margin = 1.0  # Hinge loss margin for spoof samples
     
     # Sinkhorn algorithm
@@ -58,17 +65,22 @@ class Config:
     
     # Experiment versioning
     # Change this for different runs: v1, v2, v3, freeze_encoder, etc.
-    experiment_version = "titanet_ot_memory"
+    experiment_version = "titanet_dual_bank"
     
     # Checkpointing
     # Structure: checkpoints/<version>/titanet-ot-XXXXXX-0.XXXX.ckpt
-    checkpoint_dir = f"/home/feiyueh/hw/titanet_asvspoof2019/checkpoints/{experiment_version}"
+    checkpoint_dir = f"checkpoints/{experiment_version}"
     save_top_k = 3  # Save top 3 checkpoints by EER
     
     # Logging
     # Structure: logs/<version>/version_0/events.out.tfevents...
-    log_dir = "/home/feiyueh/hw/titanet_asvspoof2019/logs"
+    log_dir = "logs"
     
+    # ASVspoof 2021 LA Eval
+    base_path_2021 = "/home/feiyueh/dataset/ASVspoof2021_LA_eval"
+    eval_protocol_2021 = "keys/LA/CM/trial_metadata.txt"
+    eval_audio_dir_2021 = "flac"
+
     @classmethod
     def get_train_protocol_path(cls):
         return os.path.join(cls.base_path, cls.train_protocol)
@@ -88,4 +100,12 @@ class Config:
     @classmethod
     def get_asv_score_path(cls):
         return os.path.join(cls.base_path, cls.asv_score_file)
+        
+    @classmethod
+    def get_eval_protocol_2021_path(cls):
+        return os.path.join(cls.base_path_2021, cls.eval_protocol_2021)
+        
+    @classmethod
+    def get_eval_audio_2021_path(cls):
+        return os.path.join(cls.base_path_2021, cls.eval_audio_dir_2021)
 
