@@ -1,7 +1,8 @@
 # SAME: Speaker-Agnostic Memory-Enhanced Anti-Spoofing
 
-Audio deepfake detection using TitaNet embeddings with dual memory banks and optimal transport.
+Audio anti-spoofing using TitaNet embeddings with dual memory banks and optimal transport.
 
+Name for ECE 477 final report: OTM-Titanet: Leveraging Pre-trained Speaker Embeddings with Optimal Transport Memory for Audio Anti-Spoofing
 
 ## Quick Start
 
