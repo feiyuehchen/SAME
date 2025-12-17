@@ -1,112 +1,152 @@
-# TitaNet + OT-Regularized Memory Network for ASVspoof 2019
+# SAME: Speaker-Agnostic Memory-Enhanced Anti-Spoofing
 
-This project implements a deepfake audio detection system using **TitaNet** (as a feature extractor) and an **Optimal Transport (OT) Regularized Memory Network**. It is designed for the ASVspoof 2019 Logical Access (LA) challenge.
+Audio deepfake detection using TitaNet embeddings with dual memory banks and optimal transport.
 
-## 🚀 Quick Start
 
-### 1. Environment Setup
+## Quick Start
+
+### 1. Setup
 ```bash
-# Create environment
-conda create -n asv python=3.10 -y
-conda activate asv
+# Download ASVspoof 2019 LA Dataset
+# Download from: https://datashare.ed.ac.uk/handle/10283/3336
+# Extract to: ../LA/
+# Expected structure:
+#   LA/
+#   ├── ASVspoof2019_LA_train/
+#   ├── ASVspoof2019_LA_dev/
+#   ├── ASVspoof2019_LA_cm_protocols/
+#   └── ASVspoof2019_LA_asv_scores/
 
-# Install dependencies
-cd /home/feiyueh/hw/SAME  # (Or your project root)
+# Download ASVspoof 2021 LA Evaluation Dataset
+# Download from: https://www.asvspoof.org/index2021.html
+# Extract to: ../../dataset/ASVspoof2021_LA_eval/
+# Expected structure:
+#   ASVspoof2021_LA_eval/
+#   ├── flac/
+#   └── keys/LA/CM/trial_metadata.txt
+
+# Download TitaNet model from nvidia nemo webpage or hugginface
+# small
+# https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small
+# rename as titanet_small.nemo
+
+# Conda Environment
+conda create -n <name> python=3.10
+conda activate <name>
 pip install -r requirements.txt
+
+
+# Check configuration
+python -c "from configs.config_working import Config; Config.print_config()"
+
 ```
 
-### 2. Download TitaNet Model
-You need the pre-trained `titanet_small.nemo` model.
+### 2. Train Baseline
 ```bash
-python download_titanet.py
-```
-*Alternatively, download manually from [NVIDIA NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small) and place it in the root directory.*
+# Start training
+python run_experiment.py baseline
 
-### 3. Run Tests
-Verify that the custom layers (Sinkhorn, Memory) and data loading are working:
-```bash
-python test_forward.py
-python train.py --test
+# Monitor
+tensorboard --logdir logs/
 ```
 
-### 4. Start Training
+### 3. Run Experiments
 ```bash
-python train.py
-```
-*Training logs will be saved to `logs/titanet_ot_memory`.*
+# After baseline succeeds
+# n: 1-9
+python run_experiment.py exp{n}
 
-### 5. Monitor Training
-```bash
-tensorboard --logdir logs/titanet_ot_memory
 ```
-Access at http://localhost:6006.
+
+
+-
+
+## 📚 Documentation
+
+- **Quick Start**: `docs/QUICKSTART.md`
+- **Experiments**: `experiments/README.md`
+- **Full Structure**: `docs/PROJECT_STRUCTURE.md`
+- **Config Details**: `docs/FINAL_CONFIG_SUMMARY.md`
 
 ---
 
-## 📊 Evaluation
+## 🏗️ Model Architecture
 
-Once trained, you can evaluate the model using `evaluate.py`.
-
-### Basic Evaluation (Complete Set)
-Evaluates on the full development set (all 2,548 bona fide + 22,296 spoof samples).
-```bash
-python evaluate.py --checkpoint checkpoints/titanet_ot_memory/best.ckpt
+```
+Input Audio (waveform)
+    ↓
+[TitaNet Encoder]
+    ↓
+192-dim Embedding (z)
+    ↓
+    ├─→ [Memory Bonafide Bank] ──→ Top-K Attention ──→ Reconstruction Error (error_real)
+    │   (K=64 prototypes, 192-dim each)
+    │
+    └─→ [Memory Spoof Bank] ──→ Top-K Attention ──→ Reconstruction Error (error_spoof)
+        (K=64 prototypes, 192-dim each)
+    ↓
+[Sinkhorn Optimal Transport] ──→ Uniform Slot Usage (prevent mode collapse)
+    ↓
+[Loss Computation]
+    ├─→ Reconstruction Loss (L2 between z and reconstructed z)
+    ├─→ OT Loss (uniform distribution constraint)
+    ├─→ OC-Softmax Loss (angular margin classification)
+    └─→ Diversity Loss (encourage slot diversity)
+    ↓
+Final Score = error_spoof - error_real
 ```
 
-### Comparison with SAMO (Target-Only)
-To compare with the SAMO paper, use the `--target-only` flag, which restricts bona fide samples to target speakers only (matches SAMO protocol).
-```bash
-python evaluate.py --checkpoint checkpoints/titanet_ot_memory/best.ckpt --target-only
-```
-
-### Compare Both Modes
-```bash
-python evaluate.py --checkpoint checkpoints/titanet_ot_memory/best.ckpt --compare-both
-```
-
-### Full Evaluation with Score Saving
-```bash
-python evaluate.py \
-  --checkpoint checkpoints/titanet_ot_memory/best.ckpt \
-  --eval-eval \
-  --compare-both \
-  --save-scores \
-  --output-dir evaluation_results
-```
+**Key Components:**
+- **TitaNet Encoder**: Extracts 192-dim speaker embeddings from raw audio
+- **Dual Memory Banks**: Learnable prototypes for bonafide and spoof patterns
+- **Top-K Sparse Attention**: Selects most relevant K prototypes for reconstruction
+- **Sinkhorn OT**: Ensures uniform usage of memory slots to prevent collapse
+- **Multi-Loss Training**: Combines reconstruction, OT, OC-Softmax, and diversity losses
 
 ---
 
 ## 📁 Project Structure
 
 ```
-.
-├── config.py           # Hyperparameter configuration
-├── dataset.py          # ASVspoof 2019 LA data loader
-├── model_titanet.py    # TitaNet encoder wrapper
-├── model_memory.py     # Memory Network + Sinkhorn implementation
-├── loss.py             # Reconstruction + OT Loss
-├── train.py            # Training script (PyTorch Lightning)
-├── evaluate.py         # Evaluation script
-├── eval_metrics.py     # EER & t-DCF metric calculation
-├── utils.py            # Helper functions
-├── test_forward.py     # Unit tests
-├── download_titanet.py # Model downloader
-└── TECHNICAL_DETAILS.md # Detailed architectural & theoretical documentation
+SAME/
+├── 🚀 Training Scripts
+│   └── run_experiment.py     ⭐ Unified training & experiments
+│
+├── 📦 Core Modules
+│   ├── configs/              Configuration files
+│   │   ├── config_working.py ⭐ Working config
+│   │   └── config.py         (legacy)
+│   │
+│   ├── models/               Model implementations
+│   │   ├── model_memory.py   Main model (OTMemoryTitaNet)
+│   │   ├── model_titanet.py  TitaNet wrapper
+│   │   └── loss.py           Loss functions
+│   │
+│   ├── dataset.py            Data loading
+│   ├── evaluate.py           Evaluation script
+│   └── utils.py              Helper functions
+│
+├── 🧪 experiments/           Incremental experiments
+│   ├── README.md             Experiment roadmap
+│   ├── exp1_oc_softmax.py   + OC-Softmax
+│   ├── exp2_multi_center.py + Multi-center
+│   ├── exp3_contrastive.py  + Contrastive
+│   ├── exp4_large_model.py  + Large model
+│   ├── exp5_adaptive_margin.py + Adaptive margin scheduler
+│   ├── exp6_score_fusion.py + Score fusion tuning
+│   ├── exp7_large_memory.py + Larger memory bank
+│   ├── exp8_titanet_only.py + TitaNet encoder only
+│   └── exp9_no_ot.py        + Memory without OT
+│
+├── 📚 docs/                  Documentation
+│   ├── QUICKSTART.md         ⭐ Start here
+│   ├── PROJECT_STRUCTURE.md  Full structure
+│   ├── REGRESSION_ANALYSIS.md Why old model was better
+│   └── ...                   Analysis docs
+│
+├── 💾 checkpoints/           Model checkpoints
+├── 📈 logs/                  TensorBoard logs
+└── 📦 archive/               Old files
 ```
 
-## ⚙️ Configuration (`config.py`)
-
-Key parameters to adjust:
-- `batch_size`: Default 128. Lower if OOM.
-- `memory_slots`: Default 64.
-- `lambda_ot`: Weight for OT loss (default 0.3).
-- `freeze_encoder`: Set `True` to freeze TitaNet, `False` to fine-tune.
-
-## 📈 Performance Goals
-- **EER**: < 5% (Target < 3%)
-- **min t-DCF**: < 0.1
-
-## 📝 Citation
-If you use this code, please cite the ASVspoof 2019 challenge and relevant TitaNet/OT papers.
-
-See `TECHNICAL_DETAILS.md` for in-depth explanation of the architecture, loss functions, and experimental setup.
+---

@@ -167,8 +167,14 @@ class ASVspoofDataset(Dataset):
         # Audio files are in .flac format
         audio_path = os.path.join(self.audio_dir, f"{utt_id}.flac")
         
-        # Load audio
-        waveform, sr = torchaudio.load(audio_path)
+        try:
+            # Load audio
+            waveform, sr = torchaudio.load(audio_path)
+        except Exception as e:
+            # Handle corrupted or unreadable audio files
+            print(f"Warning: Failed to load audio {audio_path}: {e}")
+            # Return zero tensor as placeholder
+            return torch.zeros(self.max_length)
         
         # Resample if necessary
         if sr != self.sample_rate:

@@ -27,6 +27,11 @@ logs/
 results/
 evaluation_results/
 *.ckpt
+old_logs/
+old_checkpoints/
+archive/
+docs/
+workspace.code-workspace
 
 # Large Model Files
 *.nemo

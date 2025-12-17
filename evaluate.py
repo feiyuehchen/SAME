@@ -8,9 +8,9 @@ import argparse
 import os
 from tqdm import tqdm
 
-from model_memory import OTMemoryTitaNet
+from models.model_memory import OTMemoryTitaNet
 from dataset import ASVspoofDataset
-from config import Config
+from configs.config_working import Config
 from utils import compute_eer, compute_tdcf, load_asv_scores, save_scores
 
 
@@ -88,11 +88,8 @@ def evaluate_model(model, dataset, device='cuda', desc='Evaluating', target_only
             # Forward pass
             outputs = model.forward(audio, compute_ot=False)
             
-            # Score calculation for Dual Bank
-            # Higher score = more bonafide
-            # Bonafide: Low Real Error, High Spoof Error -> High Score
-            # Spoof: High Real Error, Low Spoof Error -> Low Score
-            scores = outputs['error_spoof'] - outputs['error_real']
+            # Use model's unified scoring to support memory-less configs (e.g., OC-only)
+            scores = model.compute_score(outputs)
             
             all_scores.append(scores.cpu().numpy())
             all_labels.append(labels.numpy())
@@ -189,6 +186,12 @@ def evaluate_with_tdcf(scores, labels, asv_score_file):
 def main(args):
     """Main evaluation function"""
     
+    # Results dictionary to save
+    results = {
+        'checkpoint': args.checkpoint,
+        'results': {}
+    }
+    
     print("="*80)
     print("TitaNet + OT-Memory Network Evaluation")
     print("="*80)
@@ -257,6 +260,9 @@ def main(args):
             print(f"  Bonafide score: {dev_metrics['bonafide_score_mean']:.6f} ± {dev_metrics['bonafide_score_std']:.6f}")
             print(f"  Spoof score: {dev_metrics['spoof_score_mean']:.6f} ± {dev_metrics['spoof_score_std']:.6f}")
             
+            # Store results
+            results['results']['dev_complete'] = dev_metrics.copy()
+            
             # Compute t-DCF if ASV scores available
             if Config.asv_score_file:
                 asv_score_path = Config.get_asv_score_path()
@@ -264,6 +270,7 @@ def main(args):
                     min_tdcf = evaluate_with_tdcf(dev_scores, dev_labels, asv_score_path)
                     if min_tdcf is not None:
                         print(f"  min t-DCF: {min_tdcf:.4f}")
+                        results['results']['dev_complete']['min_tdcf'] = min_tdcf
             
             # Save complete scores
             if args.save_scores:
@@ -294,6 +301,9 @@ def main(args):
                 print(f"  Bonafide score: {dev_metrics_target['bonafide_score_mean']:.6f} ± {dev_metrics_target['bonafide_score_std']:.6f}")
                 print(f"  Spoof score: {dev_metrics_target['spoof_score_mean']:.6f} ± {dev_metrics_target['spoof_score_std']:.6f}")
                 
+                # Store results
+                results['results']['dev_target_only'] = dev_metrics_target.copy()
+                
                 # Compute t-DCF if ASV scores available
                 if Config.asv_score_file:
                     asv_score_path = Config.get_asv_score_path()
@@ -301,6 +311,7 @@ def main(args):
                         min_tdcf_target = evaluate_with_tdcf(dev_scores_target, dev_labels_target, asv_score_path)
                         if min_tdcf_target is not None:
                             print(f"  min t-DCF: {min_tdcf_target:.4f}")
+                            results['results']['dev_target_only']['min_tdcf'] = min_tdcf_target
                 
                 # Save target-only scores
                 if args.save_scores:
@@ -371,6 +382,9 @@ def main(args):
                 print(f"  Bonafide score: {eval_metrics['bonafide_score_mean']:.6f} ± {eval_metrics['bonafide_score_std']:.6f}")
                 print(f"  Spoof score: {eval_metrics['spoof_score_mean']:.6f} ± {eval_metrics['spoof_score_std']:.6f}")
                 
+                # Store results
+                results['results']['eval_2019_complete'] = eval_metrics.copy()
+                
                 # Compute t-DCF if ASV scores available
                 eval_asv_score = os.path.join(
                     Config.base_path,
@@ -380,6 +394,7 @@ def main(args):
                     min_tdcf_eval = evaluate_with_tdcf(eval_scores, eval_labels, eval_asv_score)
                     if min_tdcf_eval is not None:
                         print(f"  min t-DCF: {min_tdcf_eval:.4f}")
+                        results['results']['eval_2019_complete']['min_tdcf'] = min_tdcf_eval
                 
                 # Save complete scores
                 if args.save_scores:
@@ -410,6 +425,9 @@ def main(args):
                     print(f"  Bonafide score: {eval_metrics_target['bonafide_score_mean']:.6f} ± {eval_metrics_target['bonafide_score_std']:.6f}")
                     print(f"  Spoof score: {eval_metrics_target['spoof_score_mean']:.6f} ± {eval_metrics_target['spoof_score_std']:.6f}")
                     
+                    # Store results
+                    results['results']['eval_2019_target_only'] = eval_metrics_target.copy()
+                    
                     # Compute t-DCF if ASV scores available
                     eval_asv_score = os.path.join(
                         Config.base_path,
@@ -419,6 +437,7 @@ def main(args):
                         min_tdcf_eval_target = evaluate_with_tdcf(eval_scores_target, eval_labels_target, eval_asv_score)
                         if min_tdcf_eval_target is not None:
                             print(f"  min t-DCF: {min_tdcf_eval_target:.4f}")
+                            results['results']['eval_2019_target_only']['min_tdcf'] = min_tdcf_eval_target
                     
                     # Save target-only scores
                     if args.save_scores:
@@ -469,6 +488,9 @@ def main(args):
             print(f"  Bonafide score: {eval_metrics_2021['bonafide_score_mean']:.6f} ± {eval_metrics_2021['bonafide_score_std']:.6f}")
             print(f"  Spoof score: {eval_metrics_2021['spoof_score_mean']:.6f} ± {eval_metrics_2021['spoof_score_std']:.6f}")
             
+            # Store results
+            results['results']['eval_2021'] = eval_metrics_2021.copy()
+            
             # Save scores
             if args.save_scores:
                 score_file = os.path.join(args.output_dir, 'eval_scores_2021.txt')
@@ -516,6 +538,123 @@ def main(args):
         print()
         print("NOTE: Report EVAL SET results in papers, not DEV SET")
         print("="*80)
+    
+    # Save summary results
+    if args.save_scores and results['results']:
+        import json
+        from datetime import datetime
+        
+        results['timestamp'] = datetime.now().isoformat()
+        
+        # Convert numpy types to native Python types for JSON serialization
+        def convert_to_native(obj):
+            if isinstance(obj, dict):
+                return {k: convert_to_native(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_native(v) for v in obj]
+            elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+        
+        results_serializable = convert_to_native(results)
+        
+        # Save as JSON
+        summary_file = os.path.join(args.output_dir, 'evaluation_summary.json')
+        with open(summary_file, 'w') as f:
+            json.dump(results_serializable, f, indent=2)
+        print(f"\n✓ Summary saved to: {summary_file}")
+        
+        # Save as human-readable text
+        summary_txt = os.path.join(args.output_dir, 'evaluation_summary.txt')
+        with open(summary_txt, 'w') as f:
+            f.write("="*80 + "\n")
+            f.write("TitaNet + OT-Memory Network Evaluation Summary\n")
+            f.write("="*80 + "\n")
+            f.write(f"Checkpoint: {results['checkpoint']}\n")
+            f.write(f"Timestamp: {results['timestamp']}\n")
+            f.write("\n")
+            
+            for dataset_name, metrics in results['results'].items():
+                f.write("-"*60 + "\n")
+                f.write(f"{dataset_name.upper()}\n")
+                f.write("-"*60 + "\n")
+                f.write(f"  EER: {metrics['eer']*100:.4f}%\n")
+                f.write(f"  EER Threshold: {metrics['eer_threshold']:.6f}\n")
+                if 'min_tdcf' in metrics:
+                    f.write(f"  min t-DCF: {metrics['min_tdcf']:.4f}\n")
+                f.write(f"  # Bonafide: {metrics['num_bonafide']}\n")
+                f.write(f"  # Spoof: {metrics['num_spoof']}\n")
+                f.write(f"  Bonafide score: {metrics['bonafide_score_mean']:.6f} ± {metrics['bonafide_score_std']:.6f}\n")
+                f.write(f"  Spoof score: {metrics['spoof_score_mean']:.6f} ± {metrics['spoof_score_std']:.6f}\n")
+                f.write("\n")
+        print(f"✓ Summary saved to: {summary_txt}")
+        
+        # Save as CSV for easy comparison
+        import csv
+        summary_csv = os.path.join(args.output_dir, 'evaluation_summary.csv')
+        with open(summary_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Header
+            writer.writerow([
+                'Dataset', 'EER (%)', 'EER Threshold', 'min t-DCF',
+                '# Bonafide', '# Spoof',
+                'Bonafide Mean', 'Bonafide Std',
+                'Spoof Mean', 'Spoof Std'
+            ])
+            # Data rows
+            for dataset_name, metrics in results['results'].items():
+                writer.writerow([
+                    dataset_name,
+                    f"{metrics['eer']*100:.4f}",
+                    f"{metrics['eer_threshold']:.6f}",
+                    f"{metrics.get('min_tdcf', 'N/A'):.4f}" if 'min_tdcf' in metrics else 'N/A',
+                    metrics['num_bonafide'],
+                    metrics['num_spoof'],
+                    f"{metrics['bonafide_score_mean']:.6f}",
+                    f"{metrics['bonafide_score_std']:.6f}",
+                    f"{metrics['spoof_score_mean']:.6f}",
+                    f"{metrics['spoof_score_std']:.6f}"
+                ])
+        print(f"✓ CSV saved to: {summary_csv}")
+        
+        # Also append to a global results file for cross-experiment comparison
+        global_csv = './evaluation_results/all_experiments.csv'
+        os.makedirs(os.path.dirname(global_csv), exist_ok=True)
+        file_exists = os.path.exists(global_csv)
+        with open(global_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            # Write header only if file is new
+            if not file_exists:
+                writer.writerow([
+                    'Checkpoint', 'Timestamp', 'Dataset', 
+                    'EER (%)', 'EER Threshold', 'min t-DCF',
+                    '# Bonafide', '# Spoof',
+                    'Bonafide Mean', 'Bonafide Std',
+                    'Spoof Mean', 'Spoof Std'
+                ])
+            # Data rows
+            checkpoint_name = os.path.basename(results['checkpoint'])
+            for dataset_name, metrics in results['results'].items():
+                writer.writerow([
+                    checkpoint_name,
+                    results['timestamp'],
+                    dataset_name,
+                    f"{metrics['eer']*100:.4f}",
+                    f"{metrics['eer_threshold']:.6f}",
+                    f"{metrics.get('min_tdcf', 'N/A'):.4f}" if 'min_tdcf' in metrics else 'N/A',
+                    metrics['num_bonafide'],
+                    metrics['num_spoof'],
+                    f"{metrics['bonafide_score_mean']:.6f}",
+                    f"{metrics['bonafide_score_std']:.6f}",
+                    f"{metrics['spoof_score_mean']:.6f}",
+                    f"{metrics['spoof_score_std']:.6f}"
+                ])
+        print(f"✓ Results appended to: {global_csv}")
 
 
 if __name__ == "__main__":
@@ -559,14 +698,16 @@ if __name__ == "__main__":
     parser.add_argument(
         '--save-scores',
         action='store_true',
-        help='Save scores to file'
+        default=True,
+        help='Save scores to file (default: True)'
     )
+    
     
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='./evaluation_results',
-        help='Directory to save evaluation results'
+        default=None,
+        help='Directory to save evaluation results (default: auto-generated from checkpoint name)'
     )
     
     parser.add_argument(
@@ -591,9 +732,16 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    
+    # Auto-generate output directory from checkpoint name if not specified
+    if args.output_dir is None:
+        checkpoint_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
+        args.output_dir = os.path.join('./evaluation_results', checkpoint_name)
+    
     # Create output directory
     if args.save_scores:
         os.makedirs(args.output_dir, exist_ok=True)
+        print(f"Results will be saved to: {args.output_dir}")
     
     main(args)
 
