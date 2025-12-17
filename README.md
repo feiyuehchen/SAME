@@ -59,18 +59,6 @@ python run_experiment.py exp{n}
 
 ```
 
-
--
-
-## 📚 Documentation
-
-- **Quick Start**: `docs/QUICKSTART.md`
-- **Experiments**: `experiments/README.md`
-- **Full Structure**: `docs/PROJECT_STRUCTURE.md`
-- **Config Details**: `docs/FINAL_CONFIG_SUMMARY.md`
-
----
-
 ## 🏗️ Model Architecture
 
 ```
